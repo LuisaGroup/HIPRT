@@ -104,36 +104,71 @@ class PrivateStack
 class HwBvhStack
 {
   public:
-	static constexpr uint32_t StackSize = 48u;
+	// Hardware BVH stack using ds_bvh_stack_push8_pop1_rtn_b32 instruction.
+	// Uses wave32 layout (GFX12 default wavefront size = 32).
+	// ds_bvh_stack uses fixed stride of 32 dwords (one per lane in wave32).
+	// Two separate LDS regions for TLAS and BLAS to support instance transitions.
+	//
+	// GFX12 packed addr encoding (per RADV radv_build_bvh_stack_rtn_addr):
+	//   bits[14:0]  = stack index (initially 0, managed by hardware)
+	//   bits[31:15] = stack base in dwords
+	//
+	// LDS layout per wave32 (one region):
+	//   MaxStackEntries * 32 = 16 * 32 = 512 dwords
+	// Two regions (TLAS + BLAS) per wave32:
+	//   512 * 2 = 1024 dwords = 4096 bytes per wave32
+	static constexpr uint32_t MaxStackEntries	  = 16u;
+	static constexpr uint32_t DwordsPerRegion	  = MaxStackEntries * 32u; // 512 dwords per stack region per wave32
+	static constexpr uint32_t LdsDwordsPerWave32  = DwordsPerRegion * 2u;  // 1024 dwords (TLAS + BLAS)
+	static constexpr uint32_t StackSize			  = MaxStackEntries;
+	static constexpr uint32_t HwStackTerminalNode = 0xFFFFFFFEu; // GFX12 hw stack underflow sentinel
 
 	HIPRT_DEVICE HwBvhStack( uint32_t* ldsBase )
 	{
-		const uint32_t threadIndex = threadIdx.x + threadIdx.y * blockDim.x;
-		m_base					   = static_cast<uint32_t>( reinterpret_cast<__UINTPTR_TYPE__>(
-			reinterpret_cast<char*>( ldsBase ) + threadIndex * StackSize * sizeof( uint32_t ) ) );
-		m_addr					   = m_base;
+		asm volatile( "" : : "v"( ldsBase ) : "memory" );
+		m_ldsBaseDwords = 1u;
+		m_savedAddr		= InvalidValue;
+		m_addr			= buildPackedAddr( 0u );
 	}
 
+	// pop() via push8_pop1 with all-invalid children (push nothing, just pop).
 	HIPRT_DEVICE uint32_t pop()
 	{
-		m_addr -= sizeof( uint32_t );
-		return *reinterpret_cast<uint32_t*>( m_addr );
+		const uint32_t allInvalid[8] = {
+			InvalidValue, InvalidValue, InvalidValue, InvalidValue, InvalidValue, InvalidValue, InvalidValue, InvalidValue };
+		return pushChildrenAndPopClosest( InvalidValue, allInvalid );
 	}
 
-	HIPRT_DEVICE void push( uint32_t val )
+	HIPRT_DEVICE void push( uint32_t )
 	{
-		*reinterpret_cast<uint32_t*>( m_addr ) = val;
-		m_addr += sizeof( uint32_t );
+		// No-op: individual pushes not supported by hw instruction.
+		// Instance transitions use enterInstance()/exitInstance() instead.
 	}
 
-	HIPRT_DEVICE bool empty() const { return m_addr == m_base; }
+	HIPRT_DEVICE bool	  empty() const { return false; }
+	HIPRT_DEVICE uint32_t vacancy() const { return MaxStackEntries; }
 
-	HIPRT_DEVICE uint32_t vacancy() const
+	HIPRT_DEVICE void reset()
 	{
-		return ( StackSize * sizeof( uint32_t ) - ( m_addr - m_base ) ) / sizeof( uint32_t );
+		m_savedAddr = InvalidValue;
+		m_addr		= buildPackedAddr( 0u );
 	}
 
-	HIPRT_DEVICE void reset() { m_addr = m_base; }
+	// Enter BLAS: save TLAS stack addr, switch to BLAS LDS region.
+	HIPRT_DEVICE void enterInstance()
+	{
+		m_savedAddr = m_addr;
+		m_addr		= buildPackedAddr( DwordsPerRegion );
+	}
+
+	// Exit BLAS: restore TLAS stack addr.
+	HIPRT_DEVICE void exitInstance()
+	{
+		m_addr		= m_savedAddr;
+		m_savedAddr = InvalidValue;
+	}
+
+	HIPRT_DEVICE bool insideInstance() const { return m_savedAddr != InvalidValue; }
 
 	HIPRT_DEVICE uint32_t pushChildrenAndPopClosest( uint32_t data0, const uint32_t childResults[8] )
 	{
@@ -149,14 +184,43 @@ class HwBvhStack
 		data1[7] = childResults[7];
 
 		using uint2_v = uint32_t __attribute__( ( ext_vector_type( 2 ) ) );
-		uint2_v ret	  = __builtin_amdgcn_ds_bvh_stack_push8_pop1_rtn( m_addr, data0, data1, 0 );
+		uint2_v ret = __builtin_amdgcn_ds_bvh_stack_push8_pop1_rtn( m_addr, data0, data1, static_cast<int>( MaxStackEntries ) );
+
 		m_addr		  = ret[1];
-		return ret[0];
+		uint32_t node = ret[0];
+
+		if ( node == HwStackTerminalNode ) node = InvalidValue;
+		return node;
 	}
 
   private:
-	uint32_t m_base;
+	// Build GFX12 packed addr: bits[31:15] = stack base in dwords, bits[14:0] = stack index (0).
+	// For wave32: laneId = threadIndex & 31, waveId = threadIndex >> 5.
+	// No wave32 group splitting needed (unlike wave64 which splits into two wave32 halves).
+	HIPRT_DEVICE uint32_t buildPackedAddr( uint32_t regionOffset ) const
+	{
+		const uint32_t threadIndex = threadIdx.x + threadIdx.y * blockDim.x;
+		const uint32_t laneId	   = threadIndex & 31u;
+		const uint32_t waveId	   = threadIndex >> 5u;
+		const uint32_t baseDwords  = m_ldsBaseDwords + waveId * LdsDwordsPerWave32 + regionOffset + laneId;
+		return baseDwords << 15u;
+	}
+
 	uint32_t m_addr;
+	uint32_t m_savedAddr;
+	uint32_t m_ldsBaseDwords;
+
+	HIPRT_DEVICE void writeSentinel( uint32_t regionOffset ) const
+	{
+		const uint32_t threadIndex		  = threadIdx.x + threadIdx.y * blockDim.x;
+		const uint32_t laneId			  = threadIndex & 31u;
+		const uint32_t waveId			  = threadIndex >> 5u;
+		const uint32_t baseDwords		  = m_ldsBaseDwords + waveId * LdsDwordsPerWave32 + regionOffset + laneId;
+		const uint32_t sentinelByteOffset = baseDwords * 4u;
+		const uint32_t sentinel			  = HwStackTerminalNode;
+		asm volatile( "ds_store_b32 %0, %1" : : "v"( sentinelByteOffset ), "v"( sentinel ) : "memory" );
+		asm volatile( "s_waitcnt lgkmcnt(0)" ::: "memory" );
+	}
 };
 #endif
 
@@ -455,13 +519,11 @@ HIPRT_DEVICE bool TraversalBase<Stack, TraversalType>::testInternalNode(
 	if constexpr ( is_same<Stack, HwBvhStack>::value )
 	{
 		uint32_t childResults[8] = { result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7] };
-		uint32_t closestChild	 = m_stack.pushChildrenAndPopClosest( nodeIndex, childResults );
-		if ( closestChild != InvalidValue )
-		{
-			nodeIndex = closestChild;
-			return true;
-		}
-		return false;
+		// data0 = InvalidValue disables dedup filtering; the parent nodeIndex is never
+		// among its own children, and a non-matching data0 causes the hw to reject all children.
+		uint32_t closestChild = m_stack.pushChildrenAndPopClosest( InvalidValue, childResults );
+		nodeIndex			  = closestChild;
+		return closestChild != InvalidValue;
 	}
 	else
 #endif
@@ -875,7 +937,15 @@ HIPRT_DEVICE hiprtHit GeomTraversal<Stack, PrimitiveNode, TraversalType>::getNex
 	{
 		while ( isInternalNode( m_nodeIndex ) )
 		{
-			if ( !this->testInternalNode( ray, invD, m_boxNodes, m_nodeIndex ) ) m_nodeIndex = m_stack.pop();
+			if ( !this->testInternalNode( ray, invD, m_boxNodes, m_nodeIndex ) )
+			{
+				// For HwBvhStack: testInternalNode already set m_nodeIndex via push8_pop1.
+				// For software stack: need explicit pop.
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+				if constexpr ( !is_same<Stack, HwBvhStack>::value )
+#endif
+					m_nodeIndex = m_stack.pop();
+			}
 
 			if ( m_state == hiprtTraversalStateStackOverflow ) return hiprtHit();
 
@@ -1015,8 +1085,8 @@ HIPRT_DEVICE SceneTraversal<Stack, InstanceStack, TraversalType>::SceneTraversal
 	hiprtFuncTable	   funcTable,
 	uint32_t		   rayType,
 	float			   time )
-	: TraversalBase<Stack, TraversalType>( ray, stack, hint, payload, funcTable, rayType ), m_instanceStack( instanceStack ), m_mask( mask ),
-	  m_level( 0u ), m_time( time )
+	: TraversalBase<Stack, TraversalType>( ray, stack, hint, payload, funcTable, rayType ), m_instanceStack( instanceStack ),
+	  m_mask( mask ), m_level( 0u ), m_time( time )
 {
 	SceneHeader* sceneHeader = reinterpret_cast<SceneHeader*>( scene );
 	m_boxNodes				 = sceneHeader->m_boxNodes;
@@ -1160,6 +1230,21 @@ HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNe
 		if ( isInternalNode( m_nodeIndex ) )
 		{
 			if ( this->testInternalNode( ray, invD, nodes, m_nodeIndex ) ) continue;
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+			if constexpr ( is_same<Stack, HwBvhStack>::value )
+			{
+				// testInternalNode already set m_nodeIndex via push8_pop1 — skip the pop below.
+				if ( m_nodeIndex == InvalidValue && m_stack.insideInstance() )
+				{
+					m_stack.exitInstance();
+					instanceId() = InvalidValue;
+					nodes		 = m_boxNodes;
+					restoreRay( ray, invD );
+					m_nodeIndex = m_stack.pop();
+				}
+				continue;
+			}
+#endif
 		}
 		else
 		{
@@ -1176,25 +1261,41 @@ HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNe
 							m_triangleMask = 0;
 							m_nodeIndex	   = m_stack.pop();
 
-							while ( m_nodeIndex == InvalidValue && !m_stack.empty() )
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+							if constexpr ( is_same<Stack, HwBvhStack>::value )
 							{
-								if constexpr ( !is_same<InstanceStack, hiprtEmptyInstanceStack>::value )
+								if ( m_nodeIndex == InvalidValue && m_stack.insideInstance() )
 								{
-									if ( instanceId() == InvalidValue )
-									{
-										hiprtInstanceStackEntry instanceEntry = m_instanceStack.pop();
-										m_ray								  = instanceEntry.ray;
-										m_scene = reinterpret_cast<SceneHeader*>( instanceEntry.scene );
-										m_level--;
-
-										m_boxNodes		= m_scene->m_boxNodes;
-										m_instanceNodes = m_scene->m_primNodes;
-										m_frames		= m_scene->m_frames;
-									}
+									m_stack.exitInstance();
+									instanceId() = InvalidValue;
+									nodes		 = m_boxNodes;
+									restoreRay( ray, invD );
+									m_nodeIndex = m_stack.pop();
 								}
+							}
+							else
+#endif
+							{
+								while ( m_nodeIndex == InvalidValue && !m_stack.empty() )
+								{
+									if constexpr ( !is_same<InstanceStack, hiprtEmptyInstanceStack>::value )
+									{
+										if ( instanceId() == InvalidValue )
+										{
+											hiprtInstanceStackEntry instanceEntry = m_instanceStack.pop();
+											m_ray								  = instanceEntry.ray;
+											m_scene = reinterpret_cast<SceneHeader*>( instanceEntry.scene );
+											m_level--;
 
-								instanceId() = InvalidValue;
-								m_nodeIndex	 = m_stack.pop();
+											m_boxNodes		= m_scene->m_boxNodes;
+											m_instanceNodes = m_scene->m_primNodes;
+											m_frames		= m_scene->m_frames;
+										}
+									}
+
+									instanceId() = InvalidValue;
+									m_nodeIndex	 = m_stack.pop();
+								}
 							}
 						}
 						return hit;
@@ -1221,7 +1322,12 @@ HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNe
 					instanceId()	= m_instanceNodes[instanceAddr].m_primIndex;
 
 					m_nodeIndex = RootIndex;
-					m_stack.push( InvalidValue );
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+					if constexpr ( is_same<Stack, HwBvhStack>::value )
+						m_stack.enterInstance();
+					else
+#endif
+						m_stack.push( InvalidValue );
 
 					if constexpr ( !is_same<InstanceStack, hiprtEmptyInstanceStack>::value )
 					{
@@ -1251,26 +1357,42 @@ HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNe
 
 		m_triangleMask = 0;
 		m_nodeIndex	   = m_stack.pop();
-		while ( m_nodeIndex == InvalidValue && !m_stack.empty() )
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+		if constexpr ( is_same<Stack, HwBvhStack>::value )
 		{
-			if constexpr ( !is_same<InstanceStack, hiprtEmptyInstanceStack>::value )
+			if ( m_nodeIndex == InvalidValue && m_stack.insideInstance() )
 			{
-				if ( instanceId() == InvalidValue )
-				{
-					hiprtInstanceStackEntry instanceEntry = m_instanceStack.pop();
-					m_ray								  = instanceEntry.ray;
-					m_scene								  = reinterpret_cast<SceneHeader*>( instanceEntry.scene );
-					m_level--;
-
-					m_boxNodes		= m_scene->m_boxNodes;
-					m_instanceNodes = m_scene->m_primNodes;
-					m_frames		= m_scene->m_frames;
-				}
+				m_stack.exitInstance();
+				instanceId() = InvalidValue;
+				nodes		 = m_boxNodes;
+				restoreRay( ray, invD );
+				m_nodeIndex = m_stack.pop();
 			}
-			instanceId() = InvalidValue;
-			m_nodeIndex	 = m_stack.pop();
-			nodes		 = m_boxNodes;
-			restoreRay( ray, invD );
+		}
+		else
+#endif
+		{
+			while ( m_nodeIndex == InvalidValue && !m_stack.empty() )
+			{
+				if constexpr ( !is_same<InstanceStack, hiprtEmptyInstanceStack>::value )
+				{
+					if ( instanceId() == InvalidValue )
+					{
+						hiprtInstanceStackEntry instanceEntry = m_instanceStack.pop();
+						m_ray								  = instanceEntry.ray;
+						m_scene								  = reinterpret_cast<SceneHeader*>( instanceEntry.scene );
+						m_level--;
+
+						m_boxNodes		= m_scene->m_boxNodes;
+						m_instanceNodes = m_scene->m_primNodes;
+						m_frames		= m_scene->m_frames;
+					}
+				}
+				instanceId() = InvalidValue;
+				m_nodeIndex	 = m_stack.pop();
+				nodes		 = m_boxNodes;
+				restoreRay( ray, invD );
+			}
 		}
 	}
 
@@ -1903,7 +2025,7 @@ HIPRT_DEVICE float3 hiprtPointObjectToWorld(
 #pragma unroll
 	for ( uint32_t i = 0; i < hiprtMaxInstanceLevels; ++i )
 	{
-		sceneHeaders[i] = sceneHeader;
+		sceneHeaders[i]		 = sceneHeader;
 		const auto& instance = sceneHeader->m_instances[instanceIDs[i]];
 		++depth;
 		if ( instance.m_type != hiprtInstanceTypeScene ) break;
@@ -1958,7 +2080,7 @@ HIPRT_DEVICE float3 hiprtVectorObjectToWorld(
 #pragma unroll
 	for ( uint32_t i = 0; i < hiprtMaxInstanceLevels; ++i )
 	{
-		sceneHeaders[i] = sceneHeader;
+		sceneHeaders[i]		 = sceneHeader;
 		const auto& instance = sceneHeader->m_instances[instanceIDs[i]];
 		++depth;
 		if ( instance.m_type != hiprtInstanceTypeScene ) break;
@@ -2005,65 +2127,65 @@ HIPRT_DEVICE float3 hiprtVectorWorldToObject(
 // transformation getters
 HIPRT_DEVICE hiprtFrameSRT hiprtGetObjectToWorldFrameSRT( hiprtScene scene, uint32_t instanceID, float time )
 {
-    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-    const hiprt::Transform    tr(
-           sceneHeader->m_frames,
-           sceneHeader->m_instances[instanceID].m_frameIndex,
-           sceneHeader->m_instances[instanceID].m_frameCount );
-    const hiprt::Frame frame = tr.interpolateFrames( time );
+	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
+	const hiprt::Transform	  tr(
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
+	const hiprt::Frame frame = tr.interpolateFrames( time );
 
 	hiprt::SRTFrame srtFrame;
 #if defined( HIPRT_MATRIX_FRAME )
 	hiprtFrameMatrix mf;
 	memcpy( mf.matrix, frame.m_matrix, sizeof( mf.matrix ) );
-	mf.time = frame.m_time;
+	mf.time	 = frame.m_time;
 	srtFrame = hiprt::SRTFrame( mf );
 #else
 	srtFrame = frame;
 #endif
 
-    hiprtFrameSRT result;
-    result.rotation    = hiprt::qtToAxisAngle( srtFrame.m_rotation );
-    result.scale       = srtFrame.m_scale;
-    result.translation = srtFrame.m_translation;
-    result.time        = srtFrame.m_time;
-    return result;
+	hiprtFrameSRT result;
+	result.rotation	   = hiprt::qtToAxisAngle( srtFrame.m_rotation );
+	result.scale	   = srtFrame.m_scale;
+	result.translation = srtFrame.m_translation;
+	result.time		   = srtFrame.m_time;
+	return result;
 }
 
 HIPRT_DEVICE hiprtFrameSRT hiprtGetWorldToObjectFrameSRT( hiprtScene scene, uint32_t instanceID, float time )
 {
-    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-    const hiprt::Transform    tr(
-           sceneHeader->m_frames,
-           sceneHeader->m_instances[instanceID].m_frameIndex,
-           sceneHeader->m_instances[instanceID].m_frameCount );
-    const hiprt::Frame frame = tr.interpolateFrames( time );
+	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
+	const hiprt::Transform	  tr(
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
+	const hiprt::Frame frame = tr.interpolateFrames( time );
 
-    float matrixInv[3][4];
-    hiprt::computeInvTransformMatrix( frame, matrixInv );
+	float matrixInv[3][4];
+	hiprt::computeInvTransformMatrix( frame, matrixInv );
 
-    hiprtFrameMatrix mf;
-    memcpy( mf.matrix, matrixInv, sizeof( matrixInv ) );
-    mf.time = frame.m_time;
+	hiprtFrameMatrix mf;
+	memcpy( mf.matrix, matrixInv, sizeof( matrixInv ) );
+	mf.time = frame.m_time;
 
-    const hiprt::SRTFrame invSrtFrame( mf );
+	const hiprt::SRTFrame invSrtFrame( mf );
 
-    hiprtFrameSRT result;
-    result.rotation    = hiprt::qtToAxisAngle( invSrtFrame.m_rotation );
-    result.scale       = invSrtFrame.m_scale;
-    result.translation = invSrtFrame.m_translation;
-    result.time        = invSrtFrame.m_time;
-    return result;
+	hiprtFrameSRT result;
+	result.rotation	   = hiprt::qtToAxisAngle( invSrtFrame.m_rotation );
+	result.scale	   = invSrtFrame.m_scale;
+	result.translation = invSrtFrame.m_translation;
+	result.time		   = invSrtFrame.m_time;
+	return result;
 }
 
 HIPRT_DEVICE hiprtFrameMatrix hiprtGetObjectToWorldFrameMatrix( hiprtScene scene, uint32_t instanceID, float time )
 {
-    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-    const hiprt::Transform    tr(
-           sceneHeader->m_frames,
-           sceneHeader->m_instances[instanceID].m_frameIndex,
-           sceneHeader->m_instances[instanceID].m_frameCount );
-    const hiprt::Frame frame = tr.interpolateFrames( time );
+	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
+	const hiprt::Transform	  tr(
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
+	const hiprt::Frame frame = tr.interpolateFrames( time );
 
 	hiprtFrameMatrix result;
 #if defined( HIPRT_MATRIX_FRAME )
@@ -2081,27 +2203,27 @@ HIPRT_DEVICE hiprtFrameMatrix hiprtGetObjectToWorldFrameMatrix( hiprtScene scene
 	result.matrix[0][3] = frame.m_translation.x;
 	result.matrix[1][3] = frame.m_translation.y;
 	result.matrix[2][3] = frame.m_translation.z;
-	result.time         = frame.m_time;
+	result.time			= frame.m_time;
 #endif
-    return result;
+	return result;
 }
 
 HIPRT_DEVICE hiprtFrameMatrix hiprtGetWorldToObjectFrameMatrix( hiprtScene scene, uint32_t instanceID, float time )
 {
-    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-    const hiprt::Transform    tr(
-           sceneHeader->m_frames,
-           sceneHeader->m_instances[instanceID].m_frameIndex,
-           sceneHeader->m_instances[instanceID].m_frameCount );
-    const hiprt::Frame frame = tr.interpolateFrames( time );
+	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
+	const hiprt::Transform	  tr(
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
+	const hiprt::Frame frame = tr.interpolateFrames( time );
 
-    float matrixInv[3][4];
-    hiprt::computeInvTransformMatrix( frame, matrixInv );
+	float matrixInv[3][4];
+	hiprt::computeInvTransformMatrix( frame, matrixInv );
 
-    hiprtFrameMatrix result;
-    memcpy( result.matrix, matrixInv, sizeof( result.matrix ) );
-    result.time = frame.m_time;
-    return result;
+	hiprtFrameMatrix result;
+	memcpy( result.matrix, matrixInv, sizeof( result.matrix ) );
+	result.time = frame.m_time;
+	return result;
 }
 
 // explicit template instatiation
