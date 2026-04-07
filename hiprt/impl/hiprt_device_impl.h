@@ -100,6 +100,66 @@ class PrivateStack
 	uint32_t   m_top;
 };
 
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+class HwBvhStack
+{
+  public:
+	static constexpr uint32_t StackSize = 48u;
+
+	HIPRT_DEVICE HwBvhStack( uint32_t* ldsBase )
+	{
+		const uint32_t threadIndex = threadIdx.x + threadIdx.y * blockDim.x;
+		m_base					   = static_cast<uint32_t>( reinterpret_cast<__UINTPTR_TYPE__>(
+			reinterpret_cast<char*>( ldsBase ) + threadIndex * StackSize * sizeof( uint32_t ) ) );
+		m_addr					   = m_base;
+	}
+
+	HIPRT_DEVICE uint32_t pop()
+	{
+		m_addr -= sizeof( uint32_t );
+		return *reinterpret_cast<uint32_t*>( m_addr );
+	}
+
+	HIPRT_DEVICE void push( uint32_t val )
+	{
+		*reinterpret_cast<uint32_t*>( m_addr ) = val;
+		m_addr += sizeof( uint32_t );
+	}
+
+	HIPRT_DEVICE bool empty() const { return m_addr == m_base; }
+
+	HIPRT_DEVICE uint32_t vacancy() const
+	{
+		return ( StackSize * sizeof( uint32_t ) - ( m_addr - m_base ) ) / sizeof( uint32_t );
+	}
+
+	HIPRT_DEVICE void reset() { m_addr = m_base; }
+
+	HIPRT_DEVICE uint32_t pushChildrenAndPopClosest( uint32_t data0, const uint32_t childResults[8] )
+	{
+		using uint8_v = uint32_t __attribute__( ( ext_vector_type( 8 ) ) );
+		uint8_v data1;
+		data1[0] = childResults[0];
+		data1[1] = childResults[1];
+		data1[2] = childResults[2];
+		data1[3] = childResults[3];
+		data1[4] = childResults[4];
+		data1[5] = childResults[5];
+		data1[6] = childResults[6];
+		data1[7] = childResults[7];
+
+		using uint2_v = uint32_t __attribute__( ( ext_vector_type( 2 ) ) );
+		uint2_v ret	  = __builtin_amdgcn_ds_bvh_stack_push8_pop1_rtn( m_addr, data0, data1, 0 );
+		m_addr		  = ret[1];
+		return ret[0];
+	}
+
+  private:
+	uint32_t m_base;
+	uint32_t m_addr;
+};
+#endif
+
 template <typename StackEntry, bool DynamicAssignment>
 class GlobalStack
 {
@@ -372,15 +432,15 @@ HIPRT_DEVICE bool TraversalBase<Stack, TraversalType>::testInternalNode(
 #elif HIPRT_RTIP >= 31
 	hip_float3 dummy0, dummy1;
 	auto	   result = __builtin_amdgcn_image_bvh8_intersect_ray(
-		  encodeBaseAddr( nodes ),
-		  ray.maxT,
-		  0xff,
-		  { ray.origin.x, ray.origin.y, ray.origin.z },
-		  { ray.direction.x, ray.direction.y, ray.direction.z },
-		  nodeIndex,
-		  { m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w },
-		  &dummy0,
-		  &dummy1 );
+		encodeBaseAddr( nodes ),
+		ray.maxT,
+		0xff,
+		{ ray.origin.x, ray.origin.y, ray.origin.z },
+		{ ray.direction.x, ray.direction.y, ray.direction.z },
+		nodeIndex,
+		{ m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w },
+		&dummy0,
+		&dummy1 );
 #else
 	auto result = __builtin_amdgcn_image_bvh_intersect_ray_l(
 		encodeBaseAddr( nodes, nodeIndex ),
@@ -391,23 +451,39 @@ HIPRT_DEVICE bool TraversalBase<Stack, TraversalType>::testInternalNode(
 		{ m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w } );
 #endif
 
-	if ( m_stack.vacancy() < BranchingFactor - 1 )
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+	if constexpr ( is_same<Stack, HwBvhStack>::value )
 	{
-		m_state = hiprtTraversalStateStackOverflow;
-		return true;
+		uint32_t childResults[8] = { result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7] };
+		uint32_t closestChild	 = m_stack.pushChildrenAndPopClosest( nodeIndex, childResults );
+		if ( closestChild != InvalidValue )
+		{
+			nodeIndex = closestChild;
+			return true;
+		}
+		return false;
 	}
+	else
+#endif
+	{
+		if ( m_stack.vacancy() < BranchingFactor - 1 )
+		{
+			m_state = hiprtTraversalStateStackOverflow;
+			return true;
+		}
 
 #pragma unroll
-	for ( uint32_t i = BranchingFactor - 1; i >= 1; --i )
-		if ( result[i] != InvalidValue ) m_stack.push( result[i] );
+		for ( uint32_t i = BranchingFactor - 1; i >= 1; --i )
+			if ( result[i] != InvalidValue ) m_stack.push( result[i] );
 
-	if ( result[0] != InvalidValue )
-	{
-		nodeIndex = result[0];
-		return true;
+		if ( result[0] != InvalidValue )
+		{
+			nodeIndex = result[0];
+			return true;
+		}
+
+		return false;
 	}
-
-	return false;
 }
 
 template <typename Stack, hiprtTraversalType TraversalType>
@@ -649,15 +725,15 @@ HIPRT_DEVICE uint32_t TraversalBase<Stack, TraversalType>::testTrianglePair(
 
 	hip_float3 dummy0, dummy1;
 	auto	   result = __builtin_amdgcn_image_bvh8_intersect_ray(
-		  encodeBaseAddr( nodes ),
-		  ray.maxT,
-		  0xff,
-		  { ray.origin.x, ray.origin.y, ray.origin.z },
-		  { ray.direction.x, ray.direction.y, ray.direction.z },
-		  encodeNodeIndex( leafAddr, triPairIndexToType( triPairIndex ) ),
-		  { m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w },
-		  &dummy0,
-		  &dummy1 );
+		encodeBaseAddr( nodes ),
+		ray.maxT,
+		0xff,
+		{ ray.origin.x, ray.origin.y, ray.origin.z },
+		{ ray.direction.x, ray.direction.y, ray.direction.z },
+		encodeNodeIndex( leafAddr, triPairIndexToType( triPairIndex ) ),
+		{ m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w },
+		&dummy0,
+		&dummy1 );
 
 	uint32_t hitMask = 0;
 	{
@@ -968,15 +1044,15 @@ HIPRT_DEVICE bool SceneTraversal<Stack, InstanceStack, TraversalType>::transform
 #if HIPRT_RTIP >= 31
 			hip_float3 origin, direction;
 			auto	   result = __builtin_amdgcn_image_bvh8_intersect_ray(
-				  encodeBaseAddr( m_instanceNodes ),
-				  ray.maxT,
-				  0xff,
-				  { ray.origin.x, ray.origin.y, ray.origin.z },
-				  { ray.direction.x, ray.direction.y, ray.direction.z },
-				  nodeIndex,
-				  { m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w },
-				  &origin,
-				  &direction );
+				encodeBaseAddr( m_instanceNodes ),
+				ray.maxT,
+				0xff,
+				{ ray.origin.x, ray.origin.y, ray.origin.z },
+				{ ray.direction.x, ray.direction.y, ray.direction.z },
+				nodeIndex,
+				{ m_descriptor.x, m_descriptor.y, m_descriptor.z, m_descriptor.w },
+				&origin,
+				&direction );
 
 			if ( result[7] == InvalidValue ) return false;
 
@@ -1776,9 +1852,9 @@ HIPRT_DEVICE float3 hiprtPointObjectToWorld( const float3& point, hiprtScene sce
 {
 	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<hiprt::SceneHeader*>( scene );
 	const hiprt::Transform	  tr(
-		   sceneHeader->m_frames,
-		   sceneHeader->m_instances[instanceID].m_frameIndex,
-		   sceneHeader->m_instances[instanceID].m_frameCount );
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
 	hiprt::Frame frame = tr.interpolateFrames( time );
 	return frame.transform( point );
 }
@@ -1787,9 +1863,9 @@ HIPRT_DEVICE float3 hiprtPointWorldToObject( const float3& point, hiprtScene sce
 {
 	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<hiprt::SceneHeader*>( scene );
 	const hiprt::Transform	  tr(
-		   sceneHeader->m_frames,
-		   sceneHeader->m_instances[instanceID].m_frameIndex,
-		   sceneHeader->m_instances[instanceID].m_frameCount );
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
 	hiprt::Frame frame = tr.interpolateFrames( time );
 	return frame.invTransform( point );
 }
@@ -1798,9 +1874,9 @@ HIPRT_DEVICE float3 hiprtVectorObjectToWorld( const float3& vector, hiprtScene s
 {
 	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<hiprt::SceneHeader*>( scene );
 	const hiprt::Transform	  tr(
-		   sceneHeader->m_frames,
-		   sceneHeader->m_instances[instanceID].m_frameIndex,
-		   sceneHeader->m_instances[instanceID].m_frameCount );
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
 	hiprt::Frame frame = tr.interpolateFrames( time );
 	return frame.transformVector( vector );
 }
@@ -1809,9 +1885,9 @@ HIPRT_DEVICE float3 hiprtVectorWorldToObject( const float3& vector, hiprtScene s
 {
 	const hiprt::SceneHeader* sceneHeader = reinterpret_cast<hiprt::SceneHeader*>( scene );
 	const hiprt::Transform	  tr(
-		   sceneHeader->m_frames,
-		   sceneHeader->m_instances[instanceID].m_frameIndex,
-		   sceneHeader->m_instances[instanceID].m_frameCount );
+		sceneHeader->m_frames,
+		sceneHeader->m_instances[instanceID].m_frameIndex,
+		sceneHeader->m_instances[instanceID].m_frameCount );
 	hiprt::Frame frame = tr.interpolateFrames( time );
 	return frame.invTransformVector( vector );
 }
@@ -2190,3 +2266,13 @@ template class hiprtSceneTraversalClosestCustomStack<hiprtGlobalStack, hiprtDyna
 template class hiprtSceneTraversalAnyHitCustomStack<hiprtGlobalStack, hiprtDynamicInstanceStack>;
 template class hiprtSceneTraversalClosestCustomStack<hiprtDynamicStack, hiprtDynamicInstanceStack>;
 template class hiprtSceneTraversalAnyHitCustomStack<hiprtDynamicStack, hiprtDynamicInstanceStack>;
+
+#if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+template class hiprtSceneTraversalCustomStack_impl<
+	hiprt::HwBvhStack,
+	hiprtEmptyInstanceStack,
+	hiprtTraversalTerminateAtClosestHit>;
+template class hiprtSceneTraversalCustomStack_impl<hiprt::HwBvhStack, hiprtEmptyInstanceStack, hiprtTraversalTerminateAtAnyHit>;
+template class hiprtSceneTraversalClosestCustomStack<hiprt::HwBvhStack, hiprtEmptyInstanceStack>;
+template class hiprtSceneTraversalAnyHitCustomStack<hiprt::HwBvhStack, hiprtEmptyInstanceStack>;
+#endif
