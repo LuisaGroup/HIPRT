@@ -101,6 +101,25 @@ class PrivateStack
 };
 
 #if HIPRT_RTIP >= 31 && ( defined( __gfx1200__ ) || defined( __gfx1201__ ) )
+
+// Placeholder for ds_bvh_stack_push8_pop1_rtn intrinsic.
+// This function has no body — it exists as a symbol in the wrapper bitcode.
+// At codegen time, calls to this function are replaced with the real
+// @llvm.amdgcn.ds.bvh.stack.push8.pop1.rtn intrinsic using the desired
+// MaxStackEntries as an immarg. This avoids baking MaxStackEntries into the
+// wrapper at build time and allows per-kernel tuning at codegen time.
+using __luisa_uint8_v = uint32_t __attribute__( ( ext_vector_type( 8 ) ) );
+using __luisa_uint2_v = uint32_t __attribute__( ( ext_vector_type( 2 ) ) );
+extern "C" __device__ __luisa_uint2_v
+luisa_amdgcn_ds_bvh_stack_push8_pop1_rtn( uint32_t addr, uint32_t data0, __luisa_uint8_v data1 );
+
+// Extern global set by codegen to the chosen MaxStackEntries value.
+// Used to derive LDS layout constants (DwordsPerRegion, LdsDwordsPerWave32)
+// in buildPackedAddr / enterInstance / writeSentinel. After codegen replaces
+// this with a constant definition, the optimizer constant-folds all derived
+// arithmetic.
+extern "C" __device__ const uint32_t luisa_hiprt_hw_stack_max_entries;
+
 class HwBvhStack
 {
   public:
@@ -114,13 +133,11 @@ class HwBvhStack
 	//   bits[31:15] = stack base in dwords
 	//
 	// LDS layout per wave32 (one region):
-	//   MaxStackEntries * 32 = 16 * 32 = 512 dwords
+	//   MaxStackEntries * 32 dwords
 	// Two regions (TLAS + BLAS) per wave32:
-	//   512 * 2 = 1024 dwords = 4096 bytes per wave32
-	static constexpr uint32_t MaxStackEntries	  = 16u;
-	static constexpr uint32_t DwordsPerRegion	  = MaxStackEntries * 32u; // 512 dwords per stack region per wave32
-	static constexpr uint32_t LdsDwordsPerWave32  = DwordsPerRegion * 2u;  // 1024 dwords (TLAS + BLAS)
-	static constexpr uint32_t StackSize			  = MaxStackEntries;
+	//   MaxStackEntries * 32 * 2 dwords
+	//
+	// MaxStackEntries is set at codegen time via luisa_hiprt_hw_stack_max_entries.
 	static constexpr uint32_t HwStackTerminalNode = 0xFFFFFFFEu; // GFX12 hw stack underflow sentinel
 
 	HIPRT_DEVICE HwBvhStack( uint32_t* ldsBase )
@@ -146,7 +163,7 @@ class HwBvhStack
 	}
 
 	HIPRT_DEVICE bool	  empty() const { return false; }
-	HIPRT_DEVICE uint32_t vacancy() const { return MaxStackEntries; }
+	HIPRT_DEVICE uint32_t vacancy() const { return luisa_hiprt_hw_stack_max_entries; }
 
 	HIPRT_DEVICE void reset()
 	{
@@ -158,7 +175,7 @@ class HwBvhStack
 	HIPRT_DEVICE void enterInstance()
 	{
 		m_savedAddr = m_addr;
-		m_addr		= buildPackedAddr( DwordsPerRegion );
+		m_addr		= buildPackedAddr( luisa_hiprt_hw_stack_max_entries * 32u );
 	}
 
 	// Exit BLAS: restore TLAS stack addr.
@@ -172,8 +189,7 @@ class HwBvhStack
 
 	HIPRT_DEVICE uint32_t pushChildrenAndPopClosest( uint32_t data0, const uint32_t childResults[8] )
 	{
-		using uint8_v = uint32_t __attribute__( ( ext_vector_type( 8 ) ) );
-		uint8_v data1;
+		__luisa_uint8_v data1;
 		data1[0] = childResults[0];
 		data1[1] = childResults[1];
 		data1[2] = childResults[2];
@@ -183,8 +199,7 @@ class HwBvhStack
 		data1[6] = childResults[6];
 		data1[7] = childResults[7];
 
-		using uint2_v = uint32_t __attribute__( ( ext_vector_type( 2 ) ) );
-		uint2_v ret = __builtin_amdgcn_ds_bvh_stack_push8_pop1_rtn( m_addr, data0, data1, static_cast<int>( MaxStackEntries ) );
+		__luisa_uint2_v ret = luisa_amdgcn_ds_bvh_stack_push8_pop1_rtn( m_addr, data0, data1 );
 
 		m_addr		  = ret[1];
 		uint32_t node = ret[0];
@@ -199,10 +214,11 @@ class HwBvhStack
 	// No wave32 group splitting needed (unlike wave64 which splits into two wave32 halves).
 	HIPRT_DEVICE uint32_t buildPackedAddr( uint32_t regionOffset ) const
 	{
-		const uint32_t threadIndex = threadIdx.x + threadIdx.y * blockDim.x;
-		const uint32_t laneId	   = threadIndex & 31u;
-		const uint32_t waveId	   = threadIndex >> 5u;
-		const uint32_t baseDwords  = m_ldsBaseDwords + waveId * LdsDwordsPerWave32 + regionOffset + laneId;
+		const uint32_t ldsDwordsPerWave32 = luisa_hiprt_hw_stack_max_entries * 32u * 2u;
+		const uint32_t threadIndex		  = threadIdx.x + threadIdx.y * blockDim.x;
+		const uint32_t laneId			  = threadIndex & 31u;
+		const uint32_t waveId			  = threadIndex >> 5u;
+		const uint32_t baseDwords		  = m_ldsBaseDwords + waveId * ldsDwordsPerWave32 + regionOffset + laneId;
 		return baseDwords << 15u;
 	}
 
@@ -212,10 +228,11 @@ class HwBvhStack
 
 	HIPRT_DEVICE void writeSentinel( uint32_t regionOffset ) const
 	{
+		const uint32_t ldsDwordsPerWave32 = luisa_hiprt_hw_stack_max_entries * 32u * 2u;
 		const uint32_t threadIndex		  = threadIdx.x + threadIdx.y * blockDim.x;
 		const uint32_t laneId			  = threadIndex & 31u;
 		const uint32_t waveId			  = threadIndex >> 5u;
-		const uint32_t baseDwords		  = m_ldsBaseDwords + waveId * LdsDwordsPerWave32 + regionOffset + laneId;
+		const uint32_t baseDwords		  = m_ldsBaseDwords + waveId * ldsDwordsPerWave32 + regionOffset + laneId;
 		const uint32_t sentinelByteOffset = baseDwords * 4u;
 		const uint32_t sentinel			  = HwStackTerminalNode;
 		asm volatile( "ds_store_b32 %0, %1" : : "v"( sentinelByteOffset ), "v"( sentinel ) : "memory" );
