@@ -123,9 +123,8 @@ class HwBvhStack
 	static constexpr uint32_t StackSize			  = MaxStackEntries;
 	static constexpr uint32_t HwStackTerminalNode = 0xFFFFFFFEu; // GFX12 hw stack underflow sentinel
 
-	HIPRT_DEVICE HwBvhStack( uint32_t* ldsBase )
+	HIPRT_DEVICE HwBvhStack( [[maybe_unused]] uint32_t* ldsBase )
 	{
-		asm volatile( "" : : "v"( ldsBase ) : "memory" );
 		m_ldsBaseDwords = 1u;
 		m_savedAddr		= InvalidValue;
 		m_addr			= buildPackedAddr( 0u );
