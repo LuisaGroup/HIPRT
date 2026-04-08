@@ -208,6 +208,9 @@ class HwBvhStack
 		return node;
 	}
 
+	uint32_t m_addr;
+	uint32_t m_savedAddr;
+
   private:
 	// Build GFX12 packed addr: bits[31:15] = stack base in dwords, bits[14:0] = stack index (0).
 	// For wave32: laneId = threadIndex & 31, waveId = threadIndex >> 5.
@@ -222,8 +225,6 @@ class HwBvhStack
 		return baseDwords << 15u;
 	}
 
-	uint32_t m_addr;
-	uint32_t m_savedAddr;
 	uint32_t m_ldsBaseDwords;
 
 	HIPRT_DEVICE void writeSentinel( uint32_t regionOffset ) const
