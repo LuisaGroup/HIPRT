@@ -43,10 +43,9 @@ extern "C" __device__ float __ocml_native_recip_f32( float );
 using hip_float3 = float __attribute__( ( ext_vector_type( 3 ) ) );
 #endif
 
-// This is a hack as hiprtc doesnt include placement new and including <new> throws error
-// So, manually defining it for non bitcode path as hipcc does include placement new.
-// Also check if compiling via hipcc as hipcc would complain of redefinition
-#if !defined( HIPRT_BITCODE_LINKING ) && defined( __HIPCC_RTC__ )
+// Placement new for device code: needed in both RTC and bitcode paths.
+// hipcc (non-RTC, non-bitcode) already provides it, so exclude that case.
+#if defined( __HIPCC_RTC__ ) || ( defined( HIPRT_BITCODE_LINKING ) && defined( __KERNELCC__ ) )
 HIPRT_DEVICE void* operator new( size_t size, void* ptr ) noexcept { return ptr; };
 HIPRT_DEVICE void* operator new[]( size_t size, void* ptr ) noexcept { return ptr; };
 #endif

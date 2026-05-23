@@ -38,6 +38,7 @@
 #include <cstring>
 #include <cmath>
 #include <map>
+#include <new>
 #include <string>
 #include <vector>
 #include <fstream>
