@@ -255,6 +255,9 @@ extern "C" __global__ void __launch_bounds__( BatchBuilderMaxBlockSize )
 			build<InstanceNode>( list, hiprtInvalidValue, storageMemoryArena, sharedMemoryArena );
 			break;
 		}
+		case hiprtFrameTypeSRTQuaternion:
+			// batchBuild(...) rejects this frame type before this kernel is dispatched.
+			return;
 		}
 	}
 }

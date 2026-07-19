@@ -144,12 +144,12 @@ HIPRT_INLINE HIPRT_HOST_DEVICE size_t getSceneStorageBufferSize(
 	const size_t boxNodeCount,
 	const size_t primNodeSize,
 	const size_t boxNodeSize,
-	const size_t frameCount )
+	const size_t frameCount,
+	const size_t frameSize = sizeof( Frame ) )
 {
 	return RoundUp( sizeof( SceneHeader ), DefaultAlignment ) + RoundUp( boxNodeCount * boxNodeSize, DefaultAlignment ) +
 		   RoundUp( primNodeCount * primNodeSize, DefaultAlignment ) +
-		   RoundUp( primCount * sizeof( Instance ), DefaultAlignment ) +
-		   RoundUp( frameCount * sizeof( Frame ), DefaultAlignment );
+		   RoundUp( primCount * sizeof( Instance ), DefaultAlignment ) + RoundUp( frameCount * frameSize, DefaultAlignment );
 }
 
 HIPRT_INLINE HIPRT_HOST_DEVICE bool
@@ -161,7 +161,8 @@ batchBuild( const hiprtGeometryBuildInput& buildInput, const hiprtBuildOptions b
 
 HIPRT_INLINE HIPRT_HOST_DEVICE bool batchBuild( const hiprtSceneBuildInput& buildInput, const hiprtBuildOptions buildOptions )
 {
-	return buildInput.instanceCount <= buildOptions.batchBuildMaxPrimCount &&
+	return buildInput.frameType != hiprtFrameTypeSRTQuaternion &&
+		   buildInput.instanceCount <= buildOptions.batchBuildMaxPrimCount &&
 		   ( buildOptions.buildFlags & 7 ) != hiprtBuildFlagBitCustomBvhImport;
 }
 } // namespace hiprt

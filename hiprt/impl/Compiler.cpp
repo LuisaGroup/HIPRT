@@ -529,6 +529,9 @@ void Compiler::addCommonOpts( Context& context, std::vector<const char*>& opts, 
 	}
 
 	opts.push_back( "-D__USE_HIP__" );
+#if defined( HIPRT_MATRIX_FRAME )
+	opts.push_back( "-DHIPRT_MATRIX_FRAME=1" );
+#endif
 	opts.push_back( "-std=c++17" );
 }
 
@@ -638,6 +641,11 @@ std::string Compiler::getCacheFilename(
 	deviceName				  = deviceName.substr( 0, deviceName.find( ":" ) );
 
 	std::string moduleHash = moduleName.string() + src;
+#if defined( HIPRT_MATRIX_FRAME )
+	moduleHash += "-hiprt-internal-frame-abi-matrix-v2";
+#else
+	moduleHash += "-hiprt-internal-frame-abi-srt-v2";
+#endif
 	moduleHash			   = Utility::format( "%08x", Utility::hashString( moduleHash ) );
 
 	std::string optionHash = moduleName.string();

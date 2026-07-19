@@ -39,6 +39,13 @@ using Frame = MatrixFrame;
 using Frame = SRTFrame;
 #endif
 
+enum FrameStorageType : uint32_t
+{
+	FrameStorageTypeInternal,
+	FrameStorageTypeSRTQuaternion
+};
+HIPRT_STATIC_ASSERT( sizeof( FrameStorageType ) == sizeof( uint32_t ) );
+
 HIPRT_HOST_DEVICE HIPRT_INLINE static bool
 identitySRT( const float3& scale, const float3& shear, const float4& rotation, const float3& translation )
 {
@@ -182,6 +189,7 @@ struct alignas( 64 ) SRTFrame
 		f.m_shear		= mix( f0.m_shear, f1.m_shear, t );
 		f.m_translation = mix( f0.m_translation, f1.m_translation, t );
 		f.m_rotation	= qtMix( f0.m_rotation, f1.m_rotation, t );
+		f.m_time		= mix( f0.m_time, f1.m_time, t );
 		return f;
 	}
 
@@ -310,6 +318,7 @@ struct alignas( 64 ) MatrixFrame
 				f.m_matrix[i][j] = mix( f0.m_matrix[i][j], f1.m_matrix[i][j], t );
 			}
 		}
+		f.m_time = mix( f0.m_time, f1.m_time, t );
 		return f;
 	}
 
@@ -366,6 +375,60 @@ struct alignas( 64 ) MatrixFrame
 };
 HIPRT_STATIC_ASSERT( sizeof( MatrixFrame ) == 64 );
 
+HIPRT_HOST_DEVICE HIPRT_INLINE static size_t getFrameSize( const FrameStorageType type )
+{
+	return type == FrameStorageTypeSRTQuaternion ? sizeof( hiprtFrameSRTQuaternion ) : sizeof( Frame );
+}
+
+HIPRT_HOST_DEVICE static hiprtFrameSRTQuaternion
+interpolateSRTQuaternionFramePair( const hiprtFrameSRTQuaternion& f0, const hiprtFrameSRTQuaternion& f1, const float t )
+{
+	hiprtFrameSRTQuaternion f{};
+	const float4			q0 = qtNormalize( f0.rotation );
+	const float4			q1 = qtNormalize( f1.rotation );
+	f.rotation				   = qtNormalize( mix( q0, q1, t ) );
+	f.pivot					   = mix( f0.pivot, f1.pivot, t );
+	f.scale					   = mix( f0.scale, f1.scale, t );
+	f.shear					   = mix( f0.shear, f1.shear, t );
+	f.translation			   = mix( f0.translation, f1.translation, t );
+	f.time					   = mix( f0.time, f1.time, t );
+	return f;
+}
+
+HIPRT_HOST_DEVICE static Frame srtQuaternionToFrame( const hiprtFrameSRTQuaternion& frame )
+{
+	const float4 rotation = qtNormalize( frame.rotation );
+	float		 Q[3][3];
+	qtToRotationMatrix( rotation, Q );
+
+	hiprtFrameMatrix matrixFrame{};
+#ifdef __KERNECC__
+#pragma unroll
+#endif
+	for ( uint32_t i = 0; i < 3; ++i )
+	{
+		matrixFrame.matrix[i][0] = Q[i][0] * frame.scale.x;
+		matrixFrame.matrix[i][1] = Q[i][0] * frame.shear.x + Q[i][1] * frame.scale.y;
+		matrixFrame.matrix[i][2] = Q[i][0] * frame.shear.y + Q[i][1] * frame.shear.z + Q[i][2] * frame.scale.z;
+	}
+	matrixFrame.matrix[0][3] =
+		Q[0][0] * frame.pivot.x + Q[0][1] * frame.pivot.y + Q[0][2] * frame.pivot.z + frame.translation.x;
+	matrixFrame.matrix[1][3] =
+		Q[1][0] * frame.pivot.x + Q[1][1] * frame.pivot.y + Q[1][2] * frame.pivot.z + frame.translation.y;
+	matrixFrame.matrix[2][3] =
+		Q[2][0] * frame.pivot.x + Q[2][1] * frame.pivot.y + Q[2][2] * frame.pivot.z + frame.translation.z;
+	matrixFrame.time = frame.time;
+	return Frame( matrixFrame );
+}
+
+HIPRT_HOST_DEVICE static float3 srtQuaternionPreRotationTransform( const hiprtFrameSRTQuaternion& frame, const float3& p )
+{
+	return {
+		frame.scale.x * p.x + frame.shear.x * p.y + frame.shear.y * p.z + frame.pivot.x,
+		frame.scale.y * p.y + frame.shear.z * p.z + frame.pivot.y,
+		frame.scale.z * p.z + frame.pivot.z };
+}
+
 HIPRT_HOST_DEVICE static bool computeInvTransformMatrix( const SRTFrame& frame, float ( &matrixInv )[3][4] )
 {
 	if ( identitySRT( frame.m_scale, frame.m_shear, frame.m_rotation, frame.m_translation ) )
@@ -410,25 +473,29 @@ HIPRT_HOST_DEVICE static bool computeInvTransformMatrix( const MatrixFrame& fram
 class Transform
 {
   public:
-	HIPRT_HOST_DEVICE Transform( const Frame* frameData, uint32_t frameIndex, uint32_t frameCount )
-		: m_frameCount( frameCount ), m_frames( nullptr )
+	HIPRT_HOST_DEVICE
+	Transform( const void* frameData, uint32_t frameIndex, uint32_t frameCount, FrameStorageType frameStorageType )
+		: m_frameCount( frameCount ), m_frameStorageType( frameStorageType ), m_frames( nullptr )
 	{
-		if ( frameData != nullptr ) m_frames = frameData + frameIndex;
+		if ( frameData != nullptr )
+			m_frames = reinterpret_cast<const uint8_t*>( frameData ) + frameIndex * getFrameSize( frameStorageType );
 	}
 
 	HIPRT_HOST_DEVICE Frame interpolateFrames( float time ) const
 	{
 		if ( m_frameCount == 0 || m_frames == nullptr ) return Frame();
+		if ( m_frameStorageType == FrameStorageTypeSRTQuaternion ) return interpolateSRTQuaternionFrames( time );
 
-		Frame f0 = m_frames[0];
-		if ( m_frameCount == 1 || time == 0.0f || time <= f0.m_time ) return f0;
+		const Frame* frames = reinterpret_cast<const Frame*>( m_frames );
+		Frame		 f0		= frames[0];
+		if ( m_frameCount == 1 || time <= f0.m_time ) return f0;
 
-		Frame f1 = m_frames[m_frameCount - 1];
+		Frame f1 = frames[m_frameCount - 1];
 		if ( time >= f1.m_time ) return f1;
 
 		for ( uint32_t i = 1; i < m_frameCount; ++i )
 		{
-			f1 = m_frames[i];
+			f1 = frames[i];
 			if ( time >= f0.m_time && time <= f1.m_time ) break;
 			f0 = f1;
 		}
@@ -467,7 +534,8 @@ class Transform
 			return outAabb;
 		}
 
-		Frame f0 = m_frames[0];
+		const Frame* frames = reinterpret_cast<const Frame*>( m_frames );
+		Frame		 f0		= frames[0];
 		outAabb.grow( f0.transform( p ) );
 
 		if ( m_frameCount == 1 ) return outAabb;
@@ -478,7 +546,7 @@ class Transform
 		Frame f1;
 		for ( uint32_t i = 1; i < m_frameCount; ++i )
 		{
-			f1		= m_frames[i];
+			f1		= frames[i];
 			float t = Delta;
 			for ( uint32_t j = 1; j <= Steps; ++j )
 			{
@@ -495,6 +563,8 @@ class Transform
 
 	HIPRT_HOST_DEVICE Aabb motionBounds( const Aabb& aabb ) const
 	{
+		if ( m_frameStorageType == FrameStorageTypeSRTQuaternion ) return srtQuaternionMotionBounds( aabb );
+
 		const float3 p0 = aabb.m_min;
 		const float3 p1 = { aabb.m_min.x, aabb.m_min.y, aabb.m_max.z };
 		const float3 p2 = { aabb.m_min.x, aabb.m_max.y, aabb.m_min.z };
@@ -517,7 +587,89 @@ class Transform
 	}
 
   private:
-	uint32_t	 m_frameCount;
-	const Frame* m_frames;
+	HIPRT_HOST_DEVICE Frame interpolateSRTQuaternionFrames( const float time ) const
+	{
+		const hiprtFrameSRTQuaternion* frames = reinterpret_cast<const hiprtFrameSRTQuaternion*>( m_frames );
+		hiprtFrameSRTQuaternion		   f0	  = frames[0];
+		if ( m_frameCount == 1 || time <= f0.time ) return srtQuaternionToFrame( f0 );
+
+		hiprtFrameSRTQuaternion f1 = frames[m_frameCount - 1];
+		if ( time >= f1.time ) return srtQuaternionToFrame( f1 );
+
+		for ( uint32_t i = 1; i < m_frameCount; ++i )
+		{
+			f1 = frames[i];
+			if ( time >= f0.time && time <= f1.time ) break;
+			f0 = f1;
+		}
+
+		const float t = ( time - f0.time ) / ( f1.time - f0.time );
+		return srtQuaternionToFrame( interpolateSRTQuaternionFramePair( f0, f1, t ) );
+	}
+
+	HIPRT_HOST_DEVICE static void growTransformedBounds( Aabb& outAabb, const Aabb& aabb, const Frame& frame )
+	{
+		outAabb.grow( frame.transform( aabb.m_min ) );
+		outAabb.grow( frame.transform( { aabb.m_min.x, aabb.m_min.y, aabb.m_max.z } ) );
+		outAabb.grow( frame.transform( { aabb.m_min.x, aabb.m_max.y, aabb.m_min.z } ) );
+		outAabb.grow( frame.transform( { aabb.m_min.x, aabb.m_max.y, aabb.m_max.z } ) );
+		outAabb.grow( frame.transform( { aabb.m_max.x, aabb.m_min.y, aabb.m_min.z } ) );
+		outAabb.grow( frame.transform( { aabb.m_max.x, aabb.m_min.y, aabb.m_max.z } ) );
+		outAabb.grow( frame.transform( { aabb.m_max.x, aabb.m_max.y, aabb.m_min.z } ) );
+		outAabb.grow( frame.transform( aabb.m_max ) );
+	}
+
+	HIPRT_HOST_DEVICE Aabb srtQuaternionMotionBounds( const Aabb& aabb ) const
+	{
+		if ( m_frameCount == 0 || m_frames == nullptr ) return aabb;
+
+		const hiprtFrameSRTQuaternion* frames = reinterpret_cast<const hiprtFrameSRTQuaternion*>( m_frames );
+		Aabb						   outAabb;
+		if ( m_frameCount == 1 )
+		{
+			growTransformedBounds( outAabb, aabb, srtQuaternionToFrame( frames[0] ) );
+			return outAabb;
+		}
+
+		const float3 points[8] = {
+			aabb.m_min,
+			{ aabb.m_min.x, aabb.m_min.y, aabb.m_max.z },
+			{ aabb.m_min.x, aabb.m_max.y, aabb.m_min.z },
+			{ aabb.m_min.x, aabb.m_max.y, aabb.m_max.z },
+			{ aabb.m_max.x, aabb.m_min.y, aabb.m_min.z },
+			{ aabb.m_max.x, aabb.m_min.y, aabb.m_max.z },
+			{ aabb.m_max.x, aabb.m_max.y, aabb.m_min.z },
+			aabb.m_max };
+
+		for ( uint32_t i = 1; i < m_frameCount; ++i )
+		{
+			const hiprtFrameSRTQuaternion& f0	  = frames[i - 1];
+			const hiprtFrameSRTQuaternion& f1	  = frames[i];
+			float						   radius = 0.0f;
+#ifdef __KERNECC__
+#pragma unroll
+#endif
+			for ( uint32_t j = 0; j < 8; ++j )
+			{
+				const float3 u0 = srtQuaternionPreRotationTransform( f0, points[j] );
+				const float3 u1 = srtQuaternionPreRotationTransform( f1, points[j] );
+				radius			= fmaxf( radius, fmaxf( sqrtf( dot( u0, u0 ) ), sqrtf( dot( u1, u1 ) ) ) );
+			}
+
+			outAabb.grow(
+				{ fminf( f0.translation.x, f1.translation.x ) - radius,
+				  fminf( f0.translation.y, f1.translation.y ) - radius,
+				  fminf( f0.translation.z, f1.translation.z ) - radius } );
+			outAabb.grow(
+				{ fmaxf( f0.translation.x, f1.translation.x ) + radius,
+				  fmaxf( f0.translation.y, f1.translation.y ) + radius,
+				  fmaxf( f0.translation.z, f1.translation.z ) + radius } );
+		}
+		return outAabb;
+	}
+
+	uint32_t		 m_frameCount;
+	FrameStorageType m_frameStorageType;
+	const void*		 m_frames;
 };
 } // namespace hiprt

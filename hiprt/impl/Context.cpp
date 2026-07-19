@@ -336,6 +336,7 @@ std::vector<hiprtGeometry> Context::compactGeometries( const std::vector<hiprtGe
 
 		header.m_boxNodes  = boxNodes;
 		header.m_primNodes = primNodes;
+		header.m_size	   = sizes[i];
 		checkOro(
 			oroMemcpyHtoDAsync( reinterpret_cast<oroDeviceptr>( geometriesOut[i] ), &header, sizeof( GeomHeader ), stream ) );
 
@@ -647,7 +648,8 @@ std::vector<hiprtScene> Context::compactScenes( const std::vector<hiprtScene>& s
 			header.m_boxNodeCount,
 			getInstanceNodeSize(),
 			getBoxNodeSize(),
-			header.m_frameCount );
+			header.m_frameCount,
+			getFrameSize( header.m_frameStorageType ) );
 		size += sizes[i];
 	}
 
@@ -666,7 +668,7 @@ std::vector<hiprtScene> Context::compactScenes( const std::vector<hiprtScene>& s
 		void*	  boxNodes	= storageMemoryArena.allocate<uint8_t>( getBoxNodeSize() * header.m_boxNodeCount );
 		void*	  primNodes = storageMemoryArena.allocate<uint8_t>( getInstanceNodeSize() * header.m_primNodeCount );
 		Instance* instances = storageMemoryArena.allocate<Instance>( header.m_primCount );
-		Frame*	  frames	= storageMemoryArena.allocate<Frame>( header.m_frameCount );
+		void* frames = storageMemoryArena.allocate<uint8_t>( header.m_frameCount * getFrameSize( header.m_frameStorageType ) );
 
 		checkOro( oroMemcpyDtoDAsync(
 			reinterpret_cast<oroDeviceptr>( boxNodes ),
@@ -683,30 +685,34 @@ std::vector<hiprtScene> Context::compactScenes( const std::vector<hiprtScene>& s
 		checkOro( oroMemcpyDtoDAsync(
 			reinterpret_cast<oroDeviceptr>( instances ),
 			reinterpret_cast<oroDeviceptr>( header.m_instances ),
-			sizeof( hiprtTransformHeader ) * header.m_primCount,
+			sizeof( Instance ) * header.m_primCount,
 			stream ) );
 
 		checkOro( oroMemcpyDtoDAsync(
 			reinterpret_cast<oroDeviceptr>( frames ),
 			reinterpret_cast<oroDeviceptr>( header.m_frames ),
-			sizeof( Frame ) * header.m_frameCount,
+			getFrameSize( header.m_frameStorageType ) * header.m_frameCount,
 			stream ) );
 
 		header.m_boxNodes  = boxNodes;
 		header.m_primNodes = primNodes;
 		header.m_instances = instances;
 		header.m_frames	   = frames;
+		header.m_size	   = sizes[i];
 		checkOro(
 			oroMemcpyHtoDAsync( reinterpret_cast<oroDeviceptr>( scenesOut[i] ), &header, sizeof( SceneHeader ), stream ) );
 
 		buffer = static_cast<uint8_t*>( buffer ) + sizes[i];
 	}
 
-	std::lock_guard<std::mutex> lockMutex( m_poolMutex );
-	m_poolHeads[{ reinterpret_cast<oroDeviceptr>( scenesOut.front() ), size }] = static_cast<uint32_t>( scenesOut.size() );
+	{
+		std::lock_guard<std::mutex> lockMutex( m_poolMutex );
+		m_poolHeads[{ reinterpret_cast<oroDeviceptr>( scenesOut.front() ), size }] =
+			static_cast<uint32_t>( scenesOut.size() );
+	}
 
 	checkOro( oroStreamSynchronize( stream ) );
-	destroyScenes( scenesOut );
+	destroyScenes( scenesIn );
 
 	return scenesOut;
 }

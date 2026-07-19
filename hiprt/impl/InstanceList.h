@@ -33,11 +33,13 @@ class InstanceList
 {
   public:
 	HIPRT_HOST_DEVICE InstanceList( const hiprtSceneBuildInput& input )
-		: m_instanceCount( input.instanceCount ), m_frameCount( input.frameCount )
+		: m_instanceCount( input.instanceCount ), m_frameCount( input.frameCount ),
+		  m_frameStorageType(
+			  input.frameType == hiprtFrameTypeSRTQuaternion ? FrameStorageTypeSRTQuaternion : FrameStorageTypeInternal )
 	{
 		m_instances		   = reinterpret_cast<hiprtInstance*>( input.instances );
 		m_transformHeaders = reinterpret_cast<hiprtTransformHeader*>( input.instanceTransformHeaders );
-		m_apiFrames		   = reinterpret_cast<ApiFrame*>( input.instanceFrames );
+		m_apiFrames		   = reinterpret_cast<const void*>( input.instanceFrames );
 		m_masks			   = reinterpret_cast<uint32_t*>( input.instanceMasks );
 	}
 
@@ -104,7 +106,7 @@ class InstanceList
 	HIPRT_DEVICE Aabb fetchAabb( const uint32_t index ) const
 	{
 		const hiprtTransformHeader header = fetchTransformHeader( index );
-		const Transform			   t( m_frames, header.frameIndex, header.frameCount );
+		const Transform			   t( m_frames, header.frameIndex, header.frameCount, m_frameStorageType );
 		const hiprtInstance		   instance = fetchInstance( index );
 		const BoxNode*			   boxNodes = instance.type == hiprtInstanceTypeScene
 												  ? reinterpret_cast<SceneHeader*>( instance.scene )->m_boxNodes
@@ -126,7 +128,7 @@ class InstanceList
 		const uint32_t index, const uint32_t axis, const float position, const Aabb& box, Aabb& leftBox, Aabb& rightBox ) const
 	{
 		const hiprtTransformHeader header = fetchTransformHeader( index );
-		const Transform			   t( m_frames, header.frameIndex, header.frameCount );
+		const Transform			   t( m_frames, header.frameIndex, header.frameCount, m_frameStorageType );
 		const hiprtInstance		   instance = fetchInstance( index );
 		const BoxNode*			   boxNodes = instance.type == hiprtInstanceTypeScene
 												  ? reinterpret_cast<SceneHeader*>( instance.scene )->m_boxNodes
@@ -167,7 +169,7 @@ class InstanceList
 	HIPRT_DEVICE Obb fetchObb( const uint32_t index, const uint32_t matrixIndex, const Aabb& box ) const
 	{
 		const hiprtTransformHeader header = fetchTransformHeader( index );
-		const Transform			   t( m_frames, header.frameIndex, header.frameCount );
+		const Transform			   t( m_frames, header.frameIndex, header.frameCount, m_frameStorageType );
 		const hiprtInstance		   instance = fetchInstance( index );
 		const BoxNode*			   boxNodes = instance.type == hiprtInstanceTypeScene
 												  ? reinterpret_cast<SceneHeader*>( instance.scene )->m_boxNodes
@@ -204,12 +206,23 @@ class InstanceList
 	HIPRT_HOST_DEVICE Frame fetchFrame( const uint32_t index ) const
 	{
 		if ( m_frameCount == 0 || m_apiFrames == nullptr || m_frames == nullptr ) return Frame();
-		return m_frames[index];
+		if ( m_frameStorageType == FrameStorageTypeSRTQuaternion )
+			return srtQuaternionToFrame( reinterpret_cast<const hiprtFrameSRTQuaternion*>( m_frames )[index] );
+		return reinterpret_cast<const Frame*>( m_frames )[index];
 	}
 
 	HIPRT_HOST_DEVICE void convertFrame( const uint32_t index )
 	{
-		if ( m_frameCount > 0 && m_apiFrames != nullptr && m_frames != nullptr ) m_frames[index] = Frame( m_apiFrames[index] );
+		if ( m_frameCount == 0 || m_apiFrames == nullptr || m_frames == nullptr ) return;
+		if ( m_frameStorageType == FrameStorageTypeSRTQuaternion )
+		{
+			reinterpret_cast<hiprtFrameSRTQuaternion*>( m_frames )[index] =
+				reinterpret_cast<const hiprtFrameSRTQuaternion*>( m_apiFrames )[index];
+		}
+		else
+		{
+			reinterpret_cast<Frame*>( m_frames )[index] = Frame( reinterpret_cast<const ApiFrame*>( m_apiFrames )[index] );
+		}
 	}
 
 	HIPRT_HOST_DEVICE bool computeInvTransformMatrix( const uint32_t index, float ( &matrix )[3][4] ) const
@@ -222,15 +235,20 @@ class InstanceList
 
 	HIPRT_HOST_DEVICE uint32_t getFrameCount() const { return m_frameCount; }
 
-	HIPRT_HOST_DEVICE void setFrames( Frame* frames ) { m_frames = frames; }
+	HIPRT_HOST_DEVICE size_t getFrameStorageSize() const { return m_frameCount * getFrameSize( m_frameStorageType ); }
+
+	HIPRT_HOST_DEVICE FrameStorageType getFrameStorageType() const { return m_frameStorageType; }
+
+	HIPRT_HOST_DEVICE void setFrames( void* frames ) { m_frames = frames; }
 
   private:
 	hiprtInstance*		  m_instances;
 	hiprtTransformHeader* m_transformHeaders;
-	Frame*				  m_frames = nullptr;
-	ApiFrame*			  m_apiFrames;
+	void*				  m_frames = nullptr;
+	const void*			  m_apiFrames;
 	uint32_t*			  m_masks;
 	uint32_t			  m_instanceCount;
 	uint32_t			  m_frameCount;
+	FrameStorageType	  m_frameStorageType;
 };
 } // namespace hiprt

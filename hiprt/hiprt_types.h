@@ -183,7 +183,9 @@ enum hiprtPrimitiveNodeType
 enum hiprtFrameType
 {
 	hiprtFrameTypeSRT,
-	hiprtFrameTypeMatrix
+	hiprtFrameTypeMatrix,
+	/*!< Quaternion SRT with pivot and shear, interpolated component-wise. */
+	hiprtFrameTypeSRTQuaternion
 };
 
 /** \brief Stack type.
@@ -510,7 +512,7 @@ struct alignas( 16 ) hiprtSceneBuildInput
 	uint32_t instanceCount;
 	/*!< Number of frames (such that instanceCount <= frameCount) */
 	uint32_t frameCount;
-	/*!< Frame type (SRT or matrix) */
+	/*!< Frame type (axis-angle SRT, matrix, or quaternion SRT) */
 	hiprtFrameType frameType = hiprtFrameTypeSRT;
 };
 HIPRT_STATIC_ASSERT( sizeof( hiprtSceneBuildInput ) == 80 );
@@ -571,6 +573,32 @@ struct alignas( 64 ) hiprtFrameMatrix
 	float time;
 };
 HIPRT_STATIC_ASSERT( sizeof( hiprtFrameMatrix ) == 64 );
+
+/** \brief Quaternion SRT transformation frame.
+ *
+ * Represents the affine transform T * R * S, where S is the upper-triangular
+ * matrix [scale.x, shear.x, shear.y; 0, scale.y, shear.z; 0, 0, scale.z]
+ * followed by pivot translation, R is a unit quaternion, and T is the final
+ * translation. Components are linearly interpolated and the quaternion is
+ * normalized after interpolation. Adjacent quaternion keyframes must have a
+ * positive dot product.
+ */
+struct alignas( 16 ) hiprtFrameSRTQuaternion
+{
+	/*!< Unit quaternion rotation (x, y, z, w) */
+	hiprtFloat4 rotation;
+	/*!< Translation applied by S before rotation */
+	hiprtFloat3 pivot;
+	/*!< Diagonal of the upper-triangular S matrix */
+	hiprtFloat3 scale;
+	/*!< Upper-triangular entries (xy, xz, yz) of S */
+	hiprtFloat3 shear;
+	/*!< Translation applied after rotation */
+	hiprtFloat3 translation;
+	/*!< Frame time */
+	float time;
+};
+HIPRT_STATIC_ASSERT( sizeof( hiprtFrameSRTQuaternion ) == 80 );
 
 /** \brief Transformation header.
  *

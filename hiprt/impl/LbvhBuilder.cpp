@@ -79,8 +79,16 @@ size_t LbvhBuilder::getStorageBufferSize(
 {
 	const size_t primCount	  = buildInput.instanceCount;
 	const size_t boxNodeCount = getMaxBoxNodeCount( buildInput, context.getRtip(), primCount );
+	const size_t frameSize =
+		buildInput.frameType == hiprtFrameTypeSRTQuaternion ? sizeof( hiprtFrameSRTQuaternion ) : sizeof( Frame );
 	return getSceneStorageBufferSize(
-		primCount, primCount, boxNodeCount, context.getInstanceNodeSize(), context.getBoxNodeSize(), buildInput.frameCount );
+		primCount,
+		primCount,
+		boxNodeCount,
+		context.getInstanceNodeSize(),
+		context.getBoxNodeSize(),
+		buildInput.frameCount,
+		frameSize );
 }
 
 void LbvhBuilder::build(
@@ -158,6 +166,22 @@ void LbvhBuilder::build(
 				context, list, buildOptions, hiprtInvalidValue, temporaryMemoryArena, stream, storageMemoryArena );
 		break;
 	}
+	case hiprtFrameTypeSRTQuaternion: {
+#if defined( HIPRT_MATRIX_FRAME )
+		// Reuse the matrix InstanceList kernel specialization. InstanceList uses
+		// the runtime frame type to retain quaternion SRT frames verbatim.
+		InstanceList<hiprtFrameMatrix> list( buildInput );
+		if ( context.getRtip() >= 31 )
+			build<Box8Node, HwInstanceNode>(
+				context, list, buildOptions, hiprtInvalidValue, temporaryMemoryArena, stream, storageMemoryArena );
+		else
+			build<Box4Node, UserInstanceNode>(
+				context, list, buildOptions, hiprtInvalidValue, temporaryMemoryArena, stream, storageMemoryArena );
+		break;
+#else
+		throw std::runtime_error( "Quaternion SRT frames require HIPRT_MATRIX_FRAME" );
+#endif
+	}
 	default:
 		throw std::runtime_error( "Not supported" );
 	}
@@ -225,6 +249,18 @@ void LbvhBuilder::update(
 		else
 			update<Box4Node, UserInstanceNode>( context, list, buildOptions, stream, storageMemoryArena );
 		break;
+	}
+	case hiprtFrameTypeSRTQuaternion: {
+#if defined( HIPRT_MATRIX_FRAME )
+		InstanceList<hiprtFrameMatrix> list( buildInput );
+		if ( context.getRtip() >= 31 )
+			update<Box8Node, HwInstanceNode>( context, list, buildOptions, stream, storageMemoryArena );
+		else
+			update<Box4Node, UserInstanceNode>( context, list, buildOptions, stream, storageMemoryArena );
+		break;
+#else
+		throw std::runtime_error( "Quaternion SRT frames require HIPRT_MATRIX_FRAME" );
+#endif
 	}
 	default:
 		throw std::runtime_error( "Not supported" );

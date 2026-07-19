@@ -56,15 +56,16 @@ struct SceneHeader
 	void* m_boxNodes;
 	void* m_primNodes;
 #endif
-	Instance* m_instances;
-	Frame*	  m_frames;
-	size_t	  m_size;
-	uint32_t  m_referenceCount;
-	uint32_t  m_primCount;
-	uint32_t  m_primNodeCount;
-	uint32_t  m_boxNodeCount;
-	uint32_t  m_frameCount;
-	uint32_t  m_rtip;
+	Instance*		 m_instances;
+	void*			 m_frames;
+	size_t			 m_size;
+	uint32_t		 m_referenceCount;
+	uint32_t		 m_primCount;
+	uint32_t		 m_primNodeCount;
+	uint32_t		 m_boxNodeCount;
+	uint32_t		 m_frameCount;
+	FrameStorageType m_frameStorageType;
+	uint32_t		 m_rtip;
 };
 HIPRT_STATIC_ASSERT( alignof( SceneHeader ) <= DefaultAlignment );
 } // namespace hiprt

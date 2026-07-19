@@ -192,7 +192,7 @@ void LbvhBuilder::build(
 	if constexpr ( std::is_same<Header, SceneHeader>::value )
 	{
 		Instance* instances = storageMemoryArena.allocate<Instance>( primitives.getCount() );
-		Frame*	  frames	= storageMemoryArena.allocate<Frame>( primitives.getFrameCount() );
+		void*	  frames	= storageMemoryArena.allocate<uint8_t>( primitives.getFrameStorageSize() );
 
 		primitives.setFrames( frames );
 		Kernel initDataKernel = compiler.getKernel(

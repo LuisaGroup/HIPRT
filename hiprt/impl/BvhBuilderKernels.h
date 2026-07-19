@@ -229,7 +229,7 @@ __device__ void InitSceneData(
 	BoxNode*	  boxNodes,
 	InstanceNode* primNodes,
 	Instance*	  instances,
-	Frame*		  frames,
+	void*		  frames,
 	SceneHeader*  sceneHeader )
 {
 	if ( index < instanceList.getCount() )
@@ -251,17 +251,18 @@ __device__ void InitSceneData(
 
 	if ( index == 0 )
 	{
-		sceneHeader->m_size			  = size;
-		sceneHeader->m_boxNodes		  = boxNodes;
-		sceneHeader->m_primNodes	  = primNodes;
-		sceneHeader->m_instances	  = instances;
-		sceneHeader->m_frames		  = frames;
-		sceneHeader->m_referenceCount = instanceList.getCount() == 1u ? 1u : 0u;
-		sceneHeader->m_primCount	  = instanceList.getCount();
-		sceneHeader->m_primNodeCount  = instanceList.getCount() == 1u ? 1u : 0u;
-		sceneHeader->m_boxNodeCount	  = 1u;
-		sceneHeader->m_frameCount	  = instanceList.getFrameCount();
-		sceneHeader->m_rtip			  = Rtip;
+		sceneHeader->m_size				= size;
+		sceneHeader->m_boxNodes			= boxNodes;
+		sceneHeader->m_primNodes		= primNodes;
+		sceneHeader->m_instances		= instances;
+		sceneHeader->m_frames			= frames;
+		sceneHeader->m_referenceCount	= instanceList.getCount() == 1u ? 1u : 0u;
+		sceneHeader->m_primCount		= instanceList.getCount();
+		sceneHeader->m_primNodeCount	= instanceList.getCount() == 1u ? 1u : 0u;
+		sceneHeader->m_boxNodeCount		= 1u;
+		sceneHeader->m_frameCount		= instanceList.getFrameCount();
+		sceneHeader->m_frameStorageType = instanceList.getFrameStorageType();
+		sceneHeader->m_rtip				= Rtip;
 	}
 }
 
@@ -271,7 +272,7 @@ extern "C" __global__ void InitSceneData_InstanceList_hiprtFrameSRT(
 	BoxNode*					boxNodes,
 	InstanceNode*				primNodes,
 	Instance*					instances,
-	Frame*						frames,
+	void*						frames,
 	SceneHeader*				sceneHeader )
 {
 	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -285,7 +286,7 @@ extern "C" __global__ void InitSceneData_InstanceList_hiprtFrameMatrix(
 	BoxNode*					   boxNodes,
 	InstanceNode*				   primNodes,
 	Instance*					   instances,
-	Frame*						   frames,
+	void*						   frames,
 	SceneHeader*				   sceneHeader )
 {
 	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -645,14 +646,11 @@ __device__ void ResetCountersAndUpdateLeaves(
 
 		if ( index < header->m_primNodeCount )
 		{
-			const uint32_t		 primIndex = primNodes[index].m_primIndex;
-			hiprtTransformHeader transform = primitives.fetchTransformHeader( primIndex );
-			primNodes[index].m_mask		   = primitives.fetchMask( primIndex );
-			if ( transform.frameCount == 1 )
-				primNodes[index].m_identity =
-					primitives.computeInvTransformMatrix( transform.frameIndex, primNodes[index].m_matrix ) ? 1 : 0;
-			else
-				primNodes[index].m_identity = 0;
+			const uint32_t primIndex = primNodes[index].m_primIndex;
+			// Hardware instance nodes embed the child boxes of the referenced
+			// BLAS root. Recreate the complete node so a BLAS refit followed by
+			// a TLAS refit does not retain stale instance-leaf bounds.
+			primNodes[index] = primitives.fetchPrimNode( primIndex );
 		}
 	}
 }
