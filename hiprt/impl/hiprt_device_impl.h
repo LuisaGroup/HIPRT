@@ -412,6 +412,16 @@ class TraversalBase
 
 	HIPRT_DEVICE hiprtTraversalState getCurrentState() { return m_state; }
 
+	// A resumable any-hit traversal may accept a candidate between two
+	// getNextHit() calls. Expose the resulting interval contraction directly
+	// instead of requiring clients to depend on TraversalBase's object layout.
+	// Expansion would be invalid because the discarded frontier is unavailable,
+	// so make monotonicity part of the operation rather than a caller convention.
+	HIPRT_DEVICE void contractRayMaxT( float maxT )
+	{
+		if ( maxT < m_ray.maxT ) m_ray.maxT = maxT;
+	}
+
 	HIPRT_DEVICE bool testInternalNode( const hiprtRay& ray, const float3& invD, BoxNode* nodes, uint32_t& nodeIndex );
 
 	HIPRT_DEVICE bool testTriangleNode(
@@ -599,36 +609,43 @@ HIPRT_DEVICE bool TraversalBase<Stack, TraversalType>::testTriangleNode(
 				uint32_t hitMask =
 					this->testTrianglePair( ray, packetNodes, leafAddr, triPairIndex, hit, secondHit, nodeEnd, rangeEnd );
 
-				bool firstHasHit  = hitMask & 1;
-				bool secondHasHit = hitMask & 2;
-				if ( useFilter )
+				// A packet instruction reports both members of a triangle pair.
+				// Treat them as two ordered candidates: invoke the filter only for
+				// the closest unprocessed member, and invoke the farther member only
+				// if the first is rejected or a later getNextHit() resumes the pair.
+				// Eagerly filtering both members is observably incorrect for filters
+				// with side effects and repeats callbacks when the pair is resumed.
+				uint32_t remainingMask = hitMask & ~triangleMask;
+				while ( remainingMask != 0 && !hasHit )
 				{
-					if ( firstHasHit && filterFunc( geomType >> 1, m_rayType, m_tableHeader, ray, m_payload, hit ) )
-						firstHasHit = false;
-					if ( secondHasHit && filterFunc( geomType >> 1, m_rayType, m_tableHeader, ray, m_payload, secondHit ) )
-						secondHasHit = false;
-				}
+					const bool		firstAvailable	= ( remainingMask & Triangle0Processed ) != 0;
+					const bool		secondAvailable = ( remainingMask & Triangle1Processed ) != 0;
+					const bool		selectFirst		= firstAvailable && ( !secondAvailable || hit.t <= secondHit.t );
+					const uint32_t	selectedMask	= selectFirst ? Triangle0Processed : Triangle1Processed;
+					const hiprtHit& selectedHit		= selectFirst ? hit : secondHit;
 
-				if ( ( triangleMask & Triangle0Processed ) == 0 )
-				{
-					hasHit = firstHasHit;
-					triangleMask |= Triangle0Processed;
-				}
+					// A candidate is processed exactly once, whether accepted or
+					// rejected. Mark it before the callback so termination or other
+					// callback side effects cannot make it reappear on resume.
+					triangleMask |= selectedMask;
+					remainingMask &= ~selectedMask;
 
-				if ( !hasHit )
-				{
-					if ( secondHasHit )
+					const bool rejected =
+						useFilter && filterFunc( geomType >> 1, m_rayType, m_tableHeader, ray, m_payload, selectedHit );
+					if ( !rejected )
 					{
-						hit.t	   = secondHit.t;
-						hit.normal = secondHit.normal;
-						hit.primID = secondHit.primID;
-						hit.uv	   = secondHit.uv;
-						hasHit	   = true;
+						if ( !selectFirst )
+						{
+							hit.t	   = secondHit.t;
+							hit.normal = secondHit.normal;
+							hit.primID = secondHit.primID;
+							hit.uv	   = secondHit.uv;
+						}
+						hasHit = true;
 					}
-					triangleMask |= Triangle1Processed;
 				}
 
-				if ( !secondHasHit || ( triangleMask & Triangle1Processed ) != 0 ) // !( secondHasHit && !secondProcessed )
+				if ( ( hitMask & ~triangleMask ) == 0 )
 				{
 					triPairIndex++;
 					triangleMask = 0;
@@ -1619,6 +1636,8 @@ class hiprtSceneTraversalCustomStack_impl
 
 	HIPRT_DEVICE hiprtTraversalState getCurrentState() { return m_traversal.getCurrentState(); }
 
+	HIPRT_DEVICE void contractRayMaxT( float maxT ) { m_traversal.contractRayMaxT( maxT ); }
+
   private:
 	hiprt::SceneTraversal<hiprtStack, hiprtInstanceStack, TraversalType> m_traversal;
 };
@@ -1994,6 +2013,12 @@ template <typename hiprtStack, typename hiprtInstanceStack>
 HIPRT_DEVICE hiprtTraversalState hiprtSceneTraversalAnyHitCustomStack<hiprtStack, hiprtInstanceStack>::getCurrentState()
 {
 	return m_impl->getCurrentState();
+}
+
+template <typename hiprtStack, typename hiprtInstanceStack>
+HIPRT_DEVICE void hiprtSceneTraversalAnyHitCustomStack<hiprtStack, hiprtInstanceStack>::contractRayMaxT( float maxT )
+{
+	m_impl->contractRayMaxT( maxT );
 }
 
 HIPRT_DEVICE float3 hiprtPointObjectToWorld( const float3& point, hiprtScene scene, uint32_t instanceID, float time )

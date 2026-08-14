@@ -497,6 +497,8 @@ class hiprtSceneTraversalAnyHitCustomStack
 		float				time	  = 0.0f );
 	HIPRT_DEVICE hiprtHit			 getNextHit();
 	HIPRT_DEVICE hiprtTraversalState getCurrentState();
+	/** \brief Contracts the active ray interval between getNextHit() calls. */
+	HIPRT_DEVICE void contractRayMaxT( float maxT );
 
   private:
 	hiprtPimpl<
