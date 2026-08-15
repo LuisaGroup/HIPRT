@@ -142,7 +142,14 @@ class HwBvhStack
 	HIPRT_DEVICE HwBvhStack( uint32_t* ldsBase )
 	{
 		asm volatile( "" : : "v"( ldsBase ) : "memory" );
-		m_ldsBaseDwords = 1u;
+		// The code generator allocates exactly
+		//   waves * regions * entries * lanes
+		// dwords. The packed address is an LDS dword index, so adding a hidden
+		// one-dword prefix makes the final lane address one past that allocation.
+		// Address zero is a valid hardware-stack base (and is used by Luisa's
+		// native instance-protocol stack), therefore the exact allocation starts
+		// at dword zero.
+		m_ldsBaseDwords = 0u;
 		m_savedAddr		= InvalidValue;
 		m_addr			= buildPackedAddr( 0u );
 	}
