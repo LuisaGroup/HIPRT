@@ -496,6 +496,8 @@ class hiprtSceneTraversalAnyHitCustomStack
 		uint32_t			rayType	  = 0,
 		float				time	  = 0.0f );
 	HIPRT_DEVICE hiprtHit			 getNextHit();
+	/** \brief Returns the next hit and its unnormalized instance-space ray. */
+	HIPRT_DEVICE hiprtHit			 getNextHit( hiprtRay& candidateRay );
 	HIPRT_DEVICE hiprtTraversalState getCurrentState();
 	/** \brief Contracts the active ray interval between getNextHit() calls. */
 	HIPRT_DEVICE void contractRayMaxT( float maxT );

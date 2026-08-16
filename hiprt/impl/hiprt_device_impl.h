@@ -1099,7 +1099,7 @@ class SceneTraversal : public TraversalBase<Stack, TraversalType>
 		uint32_t		geomType,
 		hiprtHit&		hit );
 
-	HIPRT_DEVICE hiprtHit getNextHit();
+	HIPRT_DEVICE hiprtHit getNextHit( hiprtRay* candidateRay = nullptr );
 
   protected:
 	using TraversalBase<Stack, TraversalType>::m_tableHeader;
@@ -1260,7 +1260,7 @@ HIPRT_DEVICE bool SceneTraversal<Stack, InstanceStack, TraversalType>::testLeafN
 }
 
 template <typename Stack, typename InstanceStack, hiprtTraversalType TraversalType>
-HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNextHit()
+HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNextHit( hiprtRay* candidateRay )
 {
 	BoxNode* nodes	   = m_boxNodes;
 	void*	 primNodes = nullptr;
@@ -1361,6 +1361,7 @@ HIPRT_DEVICE hiprtHit SceneTraversal<Stack, InstanceStack, TraversalType>::getNe
 								}
 							}
 						}
+						if ( candidateRay != nullptr ) *candidateRay = ray;
 						return hit;
 					}
 					else
@@ -1653,6 +1654,11 @@ class hiprtSceneTraversalCustomStack_impl
 	}
 
 	HIPRT_DEVICE hiprtHit getNextHit() { return m_traversal.getNextHit(); }
+
+	HIPRT_DEVICE hiprtHit getNextHit( hiprtRay& candidateRay )
+	{
+		return m_traversal.getNextHit( &candidateRay );
+	}
 
 	HIPRT_DEVICE hiprtTraversalState getCurrentState() { return m_traversal.getCurrentState(); }
 
@@ -2043,6 +2049,12 @@ template <typename hiprtStack, typename hiprtInstanceStack>
 HIPRT_DEVICE hiprtHit hiprtSceneTraversalAnyHitCustomStack<hiprtStack, hiprtInstanceStack>::getNextHit()
 {
 	return m_impl->getNextHit();
+}
+
+template <typename hiprtStack, typename hiprtInstanceStack>
+HIPRT_DEVICE hiprtHit hiprtSceneTraversalAnyHitCustomStack<hiprtStack, hiprtInstanceStack>::getNextHit( hiprtRay& candidateRay )
+{
+	return m_impl->getNextHit( candidateRay );
 }
 
 template <typename hiprtStack, typename hiprtInstanceStack>
