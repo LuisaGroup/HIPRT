@@ -119,6 +119,13 @@ luisa_amdgcn_ds_bvh_stack_push8_pop1_rtn( uint32_t addr, uint32_t data0, __luisa
 // arithmetic.
 extern "C" __device__ const uint32_t luisa_hiprt_hw_stack_max_entries;
 
+// Codegen may overlay multiple non-reentrant hardware-stack layouts in one
+// kernel (for example, a 9-entry two-region resumable query and a 16-entry
+// one-region synchronous query). All layouts use this common per-wave stride,
+// chosen as the maximum of their footprints, so wave intervals remain
+// disjoint even when different waves execute different traversal routes.
+extern "C" __device__ const uint32_t luisa_hiprt_hw_stack_dwords_per_wave32;
+
 class HwBvhStack
 {
   public:
@@ -228,8 +235,9 @@ class HwBvhStack
 	// No wave32 group splitting needed (unlike wave64 which splits into two wave32 halves).
 	HIPRT_DEVICE uint32_t buildPackedAddr( uint32_t regionOffset ) const
 	{
-		const uint32_t ldsDwordsPerWave32 = luisa_hiprt_hw_stack_max_entries * 32u * 2u;
-		const uint32_t threadIndex		  = threadIdx.x + threadIdx.y * blockDim.x;
+		const uint32_t ldsDwordsPerWave32 = luisa_hiprt_hw_stack_dwords_per_wave32;
+		const uint32_t threadIndex		  =
+			threadIdx.x + blockDim.x * ( threadIdx.y + blockDim.y * threadIdx.z );
 		const uint32_t laneId			  = threadIndex & 31u;
 		const uint32_t waveId			  = threadIndex >> 5u;
 		const uint32_t baseDwords		  = m_ldsBaseDwords + waveId * ldsDwordsPerWave32 + regionOffset + laneId;
@@ -240,8 +248,9 @@ class HwBvhStack
 
 	HIPRT_DEVICE void writeSentinel( uint32_t regionOffset ) const
 	{
-		const uint32_t ldsDwordsPerWave32 = luisa_hiprt_hw_stack_max_entries * 32u * 2u;
-		const uint32_t threadIndex		  = threadIdx.x + threadIdx.y * blockDim.x;
+		const uint32_t ldsDwordsPerWave32 = luisa_hiprt_hw_stack_dwords_per_wave32;
+		const uint32_t threadIndex		  =
+			threadIdx.x + blockDim.x * ( threadIdx.y + blockDim.y * threadIdx.z );
 		const uint32_t laneId			  = threadIndex & 31u;
 		const uint32_t waveId			  = threadIndex >> 5u;
 		const uint32_t baseDwords		  = m_ldsBaseDwords + waveId * ldsDwordsPerWave32 + regionOffset + laneId;
@@ -286,7 +295,11 @@ template <typename StackEntry, bool DynamicAssignment>
 HIPRT_DEVICE GlobalStack<StackEntry, DynamicAssignment>::GlobalStack(
 	hiprtGlobalStackBuffer globalStackBuffer, hiprtSharedStackBuffer sharedStackBuffer )
 {
-	const uint32_t threadIndex = threadIdx.x + threadIdx.y * blockDim.x;
+	const uint32_t threadIndex =
+		threadIdx.x + blockDim.x * ( threadIdx.y + blockDim.y * threadIdx.z );
+	const uint32_t blockIndex =
+		blockIdx.x + gridDim.x * ( blockIdx.y + gridDim.y * blockIdx.z );
+	const uint32_t threadsPerBlock = blockDim.x * blockDim.y * blockDim.z;
 	const uint32_t warpIndex   = threadIndex >> LogStride;
 	const uint32_t laneIndex   = threadIndex & ( Stride - 1 );
 
@@ -295,12 +308,12 @@ HIPRT_DEVICE GlobalStack<StackEntry, DynamicAssignment>::GlobalStack(
 	m_sharedStackSize				 = sharedStackBuffer.stackSize;
 	if constexpr ( DynamicAssignment )
 	{
-		const uint32_t warpsPerBlock	= hiprt::DivideRoundUp( blockDim.x * blockDim.y, Stride );
+		const uint32_t warpsPerBlock	= hiprt::DivideRoundUp( threadsPerBlock, Stride );
 		const uint32_t activeWarps		= globalStackBuffer.stackCount >> LogStride;
 		const uint32_t firstThreadIndex = __ffsll( static_cast<unsigned long long>( hiprt::ballot( true ) ) ) - 1;
 
 		uint32_t  warpHash			= InvalidValue;
-		uint32_t  warpHashCandidate = ( warpIndex + ( blockIdx.x + blockIdx.y * gridDim.x ) * warpsPerBlock ) % activeWarps;
+		uint32_t  warpHashCandidate = ( warpIndex + blockIndex * warpsPerBlock ) % activeWarps;
 		uint32_t* globalStackLocks	= reinterpret_cast<uint32_t*>( globalStackBuffer.stackData );
 		while ( warpHash == InvalidValue )
 		{
@@ -321,8 +334,7 @@ HIPRT_DEVICE GlobalStack<StackEntry, DynamicAssignment>::GlobalStack(
 	else
 	{
 		const uint32_t globalStackOffset =
-			laneIndex + ( warpIndex * Stride + ( blockIdx.x + blockIdx.y * gridDim.x ) * ( blockDim.x * blockDim.y ) ) *
-							globalStackBuffer.stackSize;
+			laneIndex + ( warpIndex * Stride + blockIndex * threadsPerBlock ) * globalStackBuffer.stackSize;
 		m_globalStackBuffer = reinterpret_cast<StackEntry*>( globalStackBuffer.stackData ) + globalStackOffset;
 		m_globalStackSize	= globalStackBuffer.stackSize;
 	}
@@ -334,7 +346,8 @@ HIPRT_DEVICE GlobalStack<StackEntry, DynamicAssignment>::~GlobalStack()
 	if constexpr ( DynamicAssignment )
 	{
 		__threadfence();
-		const uint32_t threadIndex		= threadIdx.x + threadIdx.y * blockDim.x;
+		const uint32_t threadIndex		=
+			threadIdx.x + blockDim.x * ( threadIdx.y + blockDim.y * threadIdx.z );
 		const uint32_t laneIndex		= threadIndex & ( Stride - 1 );
 		const uint32_t firstThreadIndex = __ffsll( static_cast<unsigned long long>( hiprt::ballot( true ) ) ) - 1;
 		if ( laneIndex == firstThreadIndex ) atomicExch( m_globalStackLock, 0 );
@@ -1656,7 +1669,12 @@ HIPRT_DEVICE hiprtPrivateStack::hiprtPrivateStack() : m_impl() {}
 
 HIPRT_DEVICE hiprtPrivateStack::~hiprtPrivateStack() { m_impl->~hiprtPrivateStack_impl(); }
 
-HIPRT_DEVICE uint32_t hiprtPrivateStack::pop() { return m_impl->pop(); }
+HIPRT_DEVICE uint32_t hiprtPrivateStack::pop()
+{
+	// Traversal treats InvalidValue as the bottom sentinel. Make pop total so
+	// an exhausted frontier terminates instead of underflowing the stack index.
+	return m_impl->empty() ? hiprtInvalidValue : m_impl->pop();
+}
 
 HIPRT_DEVICE void hiprtPrivateStack::push( uint32_t val ) { m_impl->push( val ); }
 
@@ -1690,7 +1708,15 @@ hiprtGlobalStack::hiprtGlobalStack( hiprtGlobalStackBuffer globalStackBuffer, hi
 
 HIPRT_DEVICE hiprtGlobalStack::~hiprtGlobalStack() { m_impl->~hiprtGlobalStack_impl(); }
 
-HIPRT_DEVICE uint32_t hiprtGlobalStack::pop() { return m_impl->pop(); }
+HIPRT_DEVICE uint32_t hiprtGlobalStack::pop()
+{
+	// GlobalStack::pop decrements its signed spill index before addressing
+	// memory. An empty pop would therefore access the allocation prefix; for a
+	// dynamic stack that prefix contains locks, turning one frontier underflow
+	// into later cross-wave corruption. The traversal-stack contract is the
+	// same as HwBvhStack: empty pop returns the terminal sentinel.
+	return m_impl->empty() ? hiprtInvalidValue : m_impl->pop();
+}
 
 HIPRT_DEVICE void hiprtGlobalStack::push( uint32_t val ) { m_impl->push( val ); }
 
@@ -1729,7 +1755,10 @@ hiprtDynamicStack::hiprtDynamicStack( hiprtGlobalStackBuffer globalStackBuffer, 
 
 HIPRT_DEVICE hiprtDynamicStack::~hiprtDynamicStack() { m_impl->~hiprtGlobalStack_impl(); }
 
-HIPRT_DEVICE uint32_t hiprtDynamicStack::pop() { return m_impl->pop(); }
+HIPRT_DEVICE uint32_t hiprtDynamicStack::pop()
+{
+	return m_impl->empty() ? hiprtInvalidValue : m_impl->pop();
+}
 
 HIPRT_DEVICE void hiprtDynamicStack::push( uint32_t val ) { m_impl->push( val ); }
 
